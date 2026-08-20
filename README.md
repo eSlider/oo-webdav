@@ -1,15 +1,23 @@
 # oo-webdav
 
-A pure-Go WebDAV server that exposes **ONLYOFFICE Workspace** Documents over
-WebDAV. It replaces the buggy Node `ASC.WebDav` service, uses no Node/npm, and
-authenticates against the portal's own users.
+[![Go Reference](https://pkg.go.dev/badge/github.com/eSlider/oo-webdav.svg)](https://pkg.go.dev/github.com/eSlider/oo-webdav)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://go.dev)
+[![Tests](https://github.com/eSlider/oo-webdav/actions/workflows/test.yml/badge.svg)](https://github.com/eSlider/oo-webdav/actions/workflows/test.yml)
+[![Latest Release](https://img.shields.io/github/v/tag/eSlider/oo-webdav?sort=semver&label=release)](https://github.com/eSlider/oo-webdav/releases)
+[![Docker](https://img.shields.io/badge/container-ghcr.io/eSlider/oo-webdav-2496ed.svg)](https://github.com/eSlider/oo-webdav/pkgs/container/oo-webdav)
+[![GitHub Stars](https://img.shields.io/github/stars/eSlider/oo-webdav?style=social)](https://github.com/eSlider/oo-webdav/stargazers)
+
+A pure-Go **WebDAV server for ONLYOFFICE Workspace**. It exposes the portal's
+Documents over WebDAV — replacing the buggy Node `ASC.WebDav` service — with
+no Node/npm, and authenticates against the portal's own users.
 
 Serves the portal's Files at `https://<portal>/webdav`, with the original root
 layout: **In projects · Shared with me · My documents · Common · Favorites ·
 Recent · Trash**.
 
 Built on [`github.com/eslider/go-onlyoffice`](https://github.com/eslider/go-onlyoffice)
-(a Lean REST client) and `golang.org/x/net/webdav`.
+(a lean REST client for the ONLYOFFICE API) and `golang.org/x/net/webdav`.
 
 ## Features
 
