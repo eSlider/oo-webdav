@@ -28,6 +28,9 @@ Built on [`github.com/eslider/go-onlyoffice`](https://github.com/eslider/go-only
 - Root mirrors the portal's virtual sections (`@root`).
 - Metadata-only PROPFIND (no file-body downloads), lazy content streaming.
 - Skips 0-byte uploads (Office `.~lock.*` files) that the portal rejects.
+- Tolerates portal refusals: retries `429`/`502`/`503`/`504` and rolled-back
+  `500` deadlocks with exponential backoff + jitter, honouring `Retry-After`,
+  so a busy/rate-limited portal does not surface as a failed WebDAV operation.
 
 ## Architecture
 
@@ -120,6 +123,7 @@ docker build -t ghcr.io/eslider/oo-webdav:latest .
 | `WEBDAV_ROOT_ID` | `@root`            | Root source: `@root` (sections) or `@my`       |
 | `CACHE_TTL`      | `10s`              | Per-user folder-listing cache TTL              |
 | `SESSION_TTL`    | `15m`              | Per-user session re-auth interval              |
+| `WEBDAV_MAX_RETRIES` | `5`            | Retries per portal refusal (429/5xx/deadlock) before failing the op |
 
 ## Authentication
 

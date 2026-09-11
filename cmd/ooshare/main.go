@@ -9,11 +9,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/eSlider/oo-webdav/internal/config"
 	"github.com/eSlider/oo-webdav/internal/dav"
+	"github.com/eSlider/oo-webdav/internal/httpretry"
 )
+
+// defaultMaxRetries is how many times a portal refusal is retried before it
+// surfaces to the WebDAV client. Override with WEBDAV_MAX_RETRIES.
+const defaultMaxRetries = 5
 
 // Build-time variables, set via -ldflags in the release pipeline.
 var (
@@ -31,6 +37,20 @@ func main() {
 	}
 
 	cfg := config.Load()
+
+	// go-onlyoffice captures http.DefaultClient, so installing a retrying
+	// transport here makes every portal API call absorb temporary refusals
+	// (429/502/503/504 and rolled-back deadlock 500s) with backoff+jitter
+	// instead of failing the WebDAV operation.
+	maxRetries := defaultMaxRetries
+	if v := os.Getenv("WEBDAV_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxRetries = n
+		}
+	}
+	http.DefaultClient = &http.Client{
+		Transport: httpretry.New(http.DefaultTransport, maxRetries),
+	}
 
 	srv := dav.New(cfg)
 	httpServer := &http.Server{
