@@ -18,10 +18,10 @@ import (
 // Server authenticates portal users and serves WebDAV against the per-user
 // filesystem.
 type Server struct {
-	cfg   config.Config
-	mu    sync.Mutex
-	sess  map[string]*session
-	lock  webdav.LockSystem
+	cfg  config.Config
+	mu   sync.Mutex
+	sess map[string]*session
+	lock webdav.LockSystem
 }
 
 // session is a per-user authenticated handle.
@@ -37,7 +37,7 @@ func New(cfg config.Config) *Server {
 	return &Server{
 		cfg:  cfg,
 		sess: make(map[string]*session),
-		lock: webdav.NewMemLS(),
+		lock: newPermissiveLockSystem(),
 	}
 }
 
@@ -95,7 +95,7 @@ func (s *Server) getSession(ctx context.Context, user, pass string) (*session, e
 
 	se := &session{
 		user:       user,
-		fs:         newFS(client, s.cfg.WebDAVRoot, s.cfg.CacheTTL),
+		fs:         newFS(client, s.cfg.WebDAVRoot, s.cfg.CacheTTL, s.cfg.RootCacheTTL),
 		lastActive: time.Now(),
 	}
 	se.handler = &webdav.Handler{
@@ -104,6 +104,14 @@ func (s *Server) getSession(ctx context.Context, user, pass string) (*session, e
 		LockSystem: s.lock,
 		Logger:     webdavLogger,
 	}
+
+	// Warm the expensive root-sections listing in the background so the first
+	// user request does not pay the @root aggregation round-trip.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = se.fs.listing(ctx, "/")
+	}()
 
 	s.mu.Lock()
 	s.sess[user] = se

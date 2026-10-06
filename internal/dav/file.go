@@ -21,8 +21,8 @@ type nodeInfo struct {
 	n *node
 }
 
-func (i nodeInfo) Name() string       { return i.n.name }
-func (i nodeInfo) Size() int64        { return i.n.size }
+func (i nodeInfo) Name() string { return i.n.name }
+func (i nodeInfo) Size() int64  { return i.n.size }
 func (i nodeInfo) Mode() os.FileMode {
 	if i.n.isDir {
 		return 0555 | os.ModeDir
@@ -113,14 +113,36 @@ func (r *readFile) Seek(o int64, w int) (int64, error) {
 }
 func (r *readFile) Write(p []byte) (int, error) { return 0, webdav.ErrNotImplemented }
 
-// dirFile is a directory handle; Readdir returns cached children.
+// dirFile is a directory handle; children are fetched lazily on the first
+// Readdir so PROPFIND/Stat-only callers (which open every node) do not trigger
+// a portal listing per directory.
 type dirFile struct {
-	node  *node
-	infos []os.FileInfo
-	idx   int
+	fs     *fs
+	ctx    context.Context
+	node   *node
+	path   string
+	infos  []os.FileInfo
+	loaded bool
+	idx    int
+}
+
+func (d *dirFile) load() error {
+	if d.loaded {
+		return nil
+	}
+	d.loaded = true
+	infos, err := d.fs.childrenOf(d.ctx, d.path)
+	if err != nil {
+		return err
+	}
+	d.infos = infos
+	return nil
 }
 
 func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
+	if err := d.load(); err != nil {
+		return nil, err
+	}
 	if d.idx >= len(d.infos) && count > 0 {
 		return nil, io.EOF
 	}
@@ -155,8 +177,10 @@ type writeFile struct {
 	fs       *fs
 	parentID string
 	name     string
+	path     string
 	parent   string
 	existing *node // non-nil when overwriting an existing file
+	hidden   bool  // hidden overlay file (Office/OS marker)
 	buf      bytes.Buffer
 	closed   bool
 }
@@ -186,22 +210,85 @@ func (w *writeFile) Close() error {
 		return nil
 	}
 	w.closed = true
+	if w.hidden {
+		// Office/OS marker files stay in the per-session overlay: clients can
+		// stat/get/put/delete them, but they never reach the portal and never
+		// appear in listings.
+		w.fs.hiddenPut(w.path, w.buf.Bytes())
+		return nil
+	}
 	if w.buf.Len() == 0 {
-		// The portal rejects empty uploads with "Empty file". Skip 0-byte PUTs
-		// (e.g. Office `.~lock.*` files, which Windows creates empty when
-		// opening a document) and report success. Such files carry no portal
-		// content, so nothing is lost; non-empty updates are uploaded normally.
+		// The portal rejects empty uploads ("Empty file"). For a new file,
+		// create the portal record via the extension-appropriate endpoint so
+		// the file exists: Windows Explorer "New -> Text Document"/Bitmap etc.
+		// is a 0-byte PUT. A follow-up open for the same name (LOCK creates the
+		// resource, then PUT) is recognised via existing/recent and skipped, so
+		// the file is not created twice.
+		if w.existing == nil {
+			created, err := w.fs.createEmptyFile(context.Background(), w.parentID, w.name)
+			if err != nil {
+				return err
+			}
+			if created != nil {
+				w.fs.markCreated(w.path, created.ID)
+			}
+		}
 		w.fs.invalidate(w.parent)
 		return nil
 	}
 	ctx := context.Background()
-	// Upload the buffered contents to the parent folder. OnlyOffice creates a
-	// new version when a file with the same title already exists, which
-	// matches WebDAV PUT overwrite semantics.
-	_, err := w.fs.client.UploadDavFile(ctx, w.parentID, w.name, &w.buf)
-	if err != nil {
-		return err
+	// Overwrite in place by file id. The /upload endpoint creates a second file
+	// with the same title, so it must only be used for genuinely new files.
+	if w.existing != nil && w.existing.id != "" {
+		if _, err := w.fs.client.UpdateDavFile(ctx, w.existing.id, w.name, &w.buf); err != nil {
+			return err
+		}
+		w.fs.markCreated(w.path, w.existing.id)
+	} else {
+		created, err := w.fs.client.UploadDavFile(ctx, w.parentID, w.name, &w.buf)
+		if err != nil {
+			return err
+		}
+		if created != nil {
+			w.fs.markCreated(w.path, created.ID)
+		}
 	}
 	w.fs.invalidate(w.parent)
 	return nil
+}
+
+// hiddenReadFile serves an overlay file (Office/OS marker) from memory.
+type hiddenReadFile struct {
+	n       *node
+	content []byte
+	off     int64
+}
+
+func (r *hiddenReadFile) Readdir(int) ([]os.FileInfo, error) { return nil, webdav.ErrNotImplemented }
+func (r *hiddenReadFile) Stat() (os.FileInfo, error)         { return nodeInfo{r.n}, nil }
+func (r *hiddenReadFile) Close() error                       { return nil }
+func (r *hiddenReadFile) Write([]byte) (int, error)          { return 0, webdav.ErrNotImplemented }
+
+func (r *hiddenReadFile) Read(p []byte) (int, error) {
+	if r.off >= int64(len(r.content)) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.content[r.off:])
+	r.off += int64(n)
+	return n, nil
+}
+
+func (r *hiddenReadFile) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		r.off = offset
+	case io.SeekCurrent:
+		r.off += offset
+	case io.SeekEnd:
+		r.off = int64(len(r.content)) + offset
+	}
+	if r.off < 0 {
+		r.off = 0
+	}
+	return r.off, nil
 }

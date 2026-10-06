@@ -1,3 +1,6 @@
 /ooshare
 *.log
 *.bin
+go.work
+go.work.sum
+

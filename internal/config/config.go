@@ -26,6 +26,11 @@ type Config struct {
 	WebDAVRoot string
 	// CacheTTL is how long folder listings are kept in the per-user cache.
 	CacheTTL time.Duration
+	// RootCacheTTL is how long the virtual-root sections listing (@root) is
+	// cached. Section ids are stable, so this can be much longer than the
+	// per-folder TTL; @root is the expensive aggregation call and is needed to
+	// resolve the first path segment of every request.
+	RootCacheTTL time.Duration
 	// SessionTTL is how long a per-user authenticated session is kept alive
 	// before re-validating credentials against the portal.
 	SessionTTL time.Duration
@@ -40,6 +45,7 @@ func Load() Config {
 		Realm:        env("WEBDAV_REALM", "ONLYOFFICE WebDAV"),
 		WebDAVRoot:   env("WEBDAV_ROOT_ID", "@root"),
 		CacheTTL:     envDur("CACHE_TTL", 10*time.Second),
+		RootCacheTTL: envDur("ROOT_CACHE_TTL", 10*time.Minute),
 		SessionTTL:   envDur("SESSION_TTL", 15*time.Minute),
 	}
 }

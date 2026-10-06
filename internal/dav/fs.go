@@ -1,9 +1,11 @@
 package dav
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,13 +19,151 @@ import (
 // file tree onto the ONLYOFFICE Files module for a single authenticated user.
 // The virtual root "/" maps to the portal's "@root" sections.
 type fs struct {
-	client *onlyoffice.Client
-	rootID string // portal folder id backing the WebDAV root "/"
-	ttl    time.Duration
+	client  *onlyoffice.Client
+	rootID  string // portal folder id backing the WebDAV root "/"
+	ttl     time.Duration
+	rootTTL time.Duration // longer TTL for the expensive @root sections listing
 
 	mu     sync.Mutex
 	cached map[string]*cacheEntry // key: parent dir virtual path ("/" for root)
 	rootN  string                 // resolved numeric id of the root ("" if unresolved)
+
+	// hidden is a per-session overlay for Office/OS marker files (~$…,
+	// .~lock.*, desktop.ini, …). They stay visible to WebDAV clients by exact
+	// path but are never written to the portal and never appear in listings.
+	hidden map[string]*hiddenEntry
+
+	// recent records paths this session created/renamed, with the portal file id,
+	// for a short window. It makes creation idempotent (a follow-up LOCK then PUT
+	// for the same new name must not create a second file while the portal folder
+	// listing is still catching up) and lets an immediate overwrite update the
+	// just-created file by id instead of uploading a duplicate.
+	recent map[string]recentFile
+}
+
+// recentFile is a remembered create/rename: portal id plus when it happened.
+type recentFile struct {
+	id string
+	at time.Time
+}
+
+// recentCreateTTL bounds how long a create is remembered for duplicate
+// suppression.
+const recentCreateTTL = 2 * time.Minute
+
+// markCreated records that name was created in the portal with the given id.
+func (f *fs) markCreated(name, id string) {
+	name = cleanPath(name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.recent == nil {
+		f.recent = make(map[string]recentFile)
+	}
+	now := time.Now()
+	for k, r := range f.recent {
+		if now.Sub(r.at) > recentCreateTTL {
+			delete(f.recent, k)
+		}
+	}
+	f.recent[name] = recentFile{id: id, at: now}
+}
+
+// wasRecentlyCreated returns the portal id of a name created in this session
+// within the TTL window.
+func (f *fs) wasRecentlyCreated(name string) (string, bool) {
+	name = cleanPath(name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.recent[name]
+	if !ok {
+		return "", false
+	}
+	if time.Since(r.at) > recentCreateTTL {
+		delete(f.recent, name)
+		return "", false
+	}
+	return r.id, true
+}
+
+func (f *fs) unmarkCreated(name string) {
+	name = cleanPath(name)
+	f.mu.Lock()
+	delete(f.recent, name)
+	f.mu.Unlock()
+}
+
+// hiddenEntry is one overlay file (content + mtime).
+type hiddenEntry struct {
+	content []byte
+	mtime   time.Time
+}
+
+// isHiddenName reports whether a file name belongs to the hidden overlay. These
+// are Office/OS lock and shell-metadata files: clients must still be able to
+// create, read, stat and delete them, but users should not see them.
+func isHiddenName(name string) bool {
+	base := strings.ToLower(path.Base(name))
+	if strings.HasPrefix(base, "~$") || strings.HasPrefix(base, ".~lock.") {
+		return true
+	}
+	switch base {
+	case "desktop.ini", "thumbs.db", "autorun.inf":
+		return true
+	}
+	return false
+}
+
+func (f *fs) hiddenGet(name string) (*hiddenEntry, bool) {
+	name = cleanPath(name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.hidden[name]
+	return e, ok
+}
+
+func (f *fs) hiddenPut(name string, content []byte) {
+	name = cleanPath(name)
+	cp := make([]byte, len(content))
+	copy(cp, content)
+	f.mu.Lock()
+	f.hidden[name] = &hiddenEntry{content: cp, mtime: time.Now()}
+	f.mu.Unlock()
+}
+
+func (f *fs) hiddenDelete(name string) bool {
+	name = cleanPath(name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hidden[name]; ok {
+		delete(f.hidden, name)
+		return true
+	}
+	return false
+}
+
+func (f *fs) hiddenRename(oldName, newName string) bool {
+	oldName = cleanPath(oldName)
+	newName = cleanPath(newName)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.hidden[oldName]
+	if !ok {
+		return false
+	}
+	delete(f.hidden, oldName)
+	f.hidden[newName] = e
+	return true
+}
+
+// hiddenNode adapts an overlay file to the node type.
+func hiddenNode(name string, e *hiddenEntry) *node {
+	return &node{
+		path:  cleanPath(name),
+		name:  path.Base(cleanPath(name)),
+		isDir: false,
+		size:  int64(len(e.content)),
+		mtime: e.mtime,
+	}
 }
 
 type cacheEntry struct {
@@ -42,11 +182,14 @@ type node struct {
 	mtime    time.Time
 }
 
-func newFS(client *onlyoffice.Client, rootID string, ttl time.Duration) *fs {
+func newFS(client *onlyoffice.Client, rootID string, ttl, rootTTL time.Duration) *fs {
 	if rootID == "" {
 		rootID = "@root"
 	}
-	return &fs{client: client, rootID: rootID, ttl: ttl, cached: make(map[string]*cacheEntry)}
+	if rootTTL <= 0 {
+		rootTTL = ttl
+	}
+	return &fs{client: client, rootID: rootID, ttl: ttl, rootTTL: rootTTL, cached: make(map[string]*cacheEntry), hidden: make(map[string]*hiddenEntry), recent: make(map[string]recentFile)}
 }
 
 // rootIsSections reports whether the WebDAV root is the aggregated view of the
@@ -69,8 +212,12 @@ func (f *fs) listing(ctx context.Context, dirPath string) (*onlyoffice.DavListin
 	if dirPath == "" {
 		dirPath = "/"
 	}
+	ttl := f.ttl
+	if dirPath == "/" && f.rootIsSections() {
+		ttl = f.rootTTL
+	}
 	f.mu.Lock()
-	if e, ok := f.cached[dirPath]; ok && time.Since(e.fetched) < f.ttl {
+	if e, ok := f.cached[dirPath]; ok && time.Since(e.fetched) < ttl {
 		f.mu.Unlock()
 		return e.listing, nil
 	}
@@ -247,6 +394,9 @@ func (f *fs) childrenOf(ctx context.Context, dirPath string) ([]os.FileInfo, err
 	infos := make([]os.FileInfo, 0, len(l.Files)+len(l.Folders))
 	for i := range l.Folders {
 		fd := &l.Folders[i]
+		if isHiddenName(fd.Title) {
+			continue
+		}
 		infos = append(infos, nodeInfo{&node{
 			name:  fd.Title,
 			isDir: true,
@@ -256,6 +406,9 @@ func (f *fs) childrenOf(ctx context.Context, dirPath string) ([]os.FileInfo, err
 	}
 	for i := range l.Files {
 		fi := &l.Files[i]
+		if isHiddenName(fi.Title) {
+			continue
+		}
 		infos = append(infos, nodeInfo{&node{
 			name:  fi.Title,
 			isDir: false,
@@ -272,6 +425,12 @@ func (f *fs) childrenOf(ctx context.Context, dirPath string) ([]os.FileInfo, err
 
 // Stat implements webdav.FileSystem.
 func (f *fs) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	name = cleanPath(name)
+	if isHiddenName(name) {
+		if e, ok := f.hiddenGet(name); ok {
+			return nodeInfo{hiddenNode(name, e)}, nil
+		}
+	}
 	n, err := f.resolve(ctx, name)
 	if err != nil {
 		return nil, err
@@ -294,22 +453,85 @@ func (f *fs) Mkdir(ctx context.Context, name string, _ os.FileMode) error {
 	return nil
 }
 
+// emptyCreateKind selects the portal endpoint used to materialise a 0-byte file.
+type emptyCreateKind int
+
+const (
+	createText emptyCreateKind = iota
+	createHTML
+	createFileExternal
+	createFileInternal
+)
+
+// emptyCreateFor maps a file name to the portal create endpoint required for a
+// 0-byte write. The portal cannot store an empty upload, so a file record is
+// created first (mirrors ASC.WebDav customVirtualResource.create):
+//
+//	.txt               -> POST .../text
+//	.html/.htm         -> POST .../html
+//	.docx/.xlsx/.pptx  -> POST .../file (template, EnableExternalExt=false)
+//	anything else      -> POST .../file (EnableExternalExt=true, keep extension)
+func emptyCreateFor(name string) emptyCreateKind {
+	switch strings.ToLower(strings.TrimPrefix(filepath.Ext(name), ".")) {
+	case "txt":
+		return createText
+	case "html", "htm":
+		return createHTML
+	case "docx", "xlsx", "pptx":
+		return createFileInternal
+	default:
+		return createFileExternal
+	}
+}
+
+// createEmptyFile materialises a 0-byte file in the portal via the endpoint
+// chosen by extension. The normal upload path rejects empty bodies.
+func (f *fs) createEmptyFile(ctx context.Context, parentID, name string) (*onlyoffice.DavFile, error) {
+	switch emptyCreateFor(name) {
+	case createText:
+		return f.client.CreateDavTextFile(ctx, parentID, name)
+	case createHTML:
+		return f.client.CreateDavHtmlFile(ctx, parentID, name)
+	case createFileInternal:
+		return f.client.CreateDavFile(ctx, parentID, name, false)
+	default:
+		return f.client.CreateDavFile(ctx, parentID, name, true)
+	}
+}
+
+// copyDavFile copies the content of srcID to a new file named destName in
+// destID and returns it. Used for a rename that changes the extension: the
+// portal's rename keeps a file's original extension, so a temp (.tmp) could not
+// otherwise become a .txt/.docx target.
+func (f *fs) copyDavFile(ctx context.Context, srcID, destID, destName string) (*onlyoffice.DavFile, error) {
+	var buf bytes.Buffer
+	if _, err := f.client.DownloadDavFile(ctx, srcID, &buf); err != nil {
+		return nil, err
+	}
+	return f.client.UploadDavFile(ctx, destID, destName, &buf)
+}
+
 // OpenFile implements webdav.FileSystem.
 func (f *fs) OpenFile(ctx context.Context, name string, flag int, _ os.FileMode) (fileT, error) {
 	name = cleanPath(name)
 	isReadOnly := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) == 0
 
 	if isReadOnly {
+		if isHiddenName(name) {
+			if e, ok := f.hiddenGet(name); ok {
+				return &hiddenReadFile{n: hiddenNode(name, e), content: e.content}, nil
+			}
+		}
 		n, err := f.resolve(ctx, name)
 		if err != nil {
 			return nil, err
 		}
 		if n.isDir {
-			infos, err := f.childrenOf(ctx, name)
-			if err != nil {
-				return nil, err
-			}
-			return &dirFile{node: n, infos: infos}, nil
+			// Lazy: do not enumerate the directory here. PROPFIND opens each
+			// node (including child directories) just to read properties, so
+			// eager listing here made a Depth-1 PROPFIND fetch every subfolder.
+			// childrenOf runs on the first Readdir instead.
+			return &dirFile{fs: f, ctx: ctx, node: n, path: name}, nil
 		}
 		// Reading a file: stream to a temp file so Seek/Range work.
 		return f.openReadFile(ctx, n)
@@ -326,20 +548,30 @@ func (f *fs) openReadFile(ctx context.Context, n *node) (fileT, error) {
 }
 
 func (f *fs) openWriteFile(ctx context.Context, name string) (fileT, error) {
+	name = cleanPath(name)
 	parent := parentOf(name)
+	if isHiddenName(name) {
+		// Office/OS marker files stay in the per-session overlay.
+		return &writeFile{fs: f, parent: parent, path: name, name: path.Base(name), hidden: true}, nil
+	}
 	pid, err := f.dirID(ctx, parent)
 	if err != nil {
 		return nil, err
 	}
-	// Determine whether we're overwriting an existing file.
+	// Determine whether we're overwriting an existing file. If the portal
+	// listing has not caught up with a create/rename from this session yet, fall
+	// back to the remembered id so we update that file instead of duplicating it.
 	var existing *node
 	if n, err := f.resolve(ctx, name); err == nil && !n.isDir {
 		existing = n
+	} else if id, ok := f.wasRecentlyCreated(name); ok {
+		existing = &node{path: name, name: path.Base(name), isDir: false, id: id}
 	}
 	return &writeFile{
 		fs:       f,
 		parentID: pid,
 		name:     path.Base(name),
+		path:     name,
 		parent:   parent,
 		existing: existing,
 	}, nil
@@ -350,6 +582,10 @@ func (f *fs) RemoveAll(ctx context.Context, name string) error {
 	name = cleanPath(name)
 	if name == "/" {
 		return &os.PathError{Op: "remove", Path: name, Err: os.ErrPermission}
+	}
+	if isHiddenName(name) && f.hiddenDelete(name) {
+		f.invalidate(parentOf(name))
+		return nil
 	}
 	n, err := f.resolve(ctx, name)
 	if err != nil {
@@ -364,6 +600,7 @@ func (f *fs) RemoveAll(ctx context.Context, name string) error {
 	if err := f.client.DeleteDavItems(ctx, dIDs, fIDs); err != nil {
 		return err
 	}
+	f.unmarkCreated(name)
 	f.invalidate(parentOf(name))
 	return nil
 }
@@ -372,6 +609,45 @@ func (f *fs) RemoveAll(ctx context.Context, name string) error {
 func (f *fs) Rename(ctx context.Context, oldName, newName string) error {
 	oldName = cleanPath(oldName)
 	newName = cleanPath(newName)
+
+	oldHidden := isHiddenName(oldName)
+	newHidden := isHiddenName(newName)
+
+	// Hidden -> hidden: move inside the overlay.
+	if oldHidden && newHidden && f.hiddenRename(oldName, newName) {
+		return nil
+	}
+	// Hidden -> real: materialise the overlay content into the portal (Office
+	// atomic save writes a temp/marker then renames it onto the target).
+	if oldHidden && !newHidden {
+		if e, ok := f.hiddenGet(oldName); ok {
+			destParent := parentOf(newName)
+			destID, err := f.dirID(ctx, destParent)
+			if err != nil {
+				return err
+			}
+			base := path.Base(newName)
+			var created *onlyoffice.DavFile
+			if len(e.content) > 0 {
+				created, err = f.client.UploadDavFile(ctx, destID, base, bytes.NewReader(e.content))
+				if err != nil {
+					return err
+				}
+			} else {
+				created, err = f.createEmptyFile(ctx, destID, base)
+				if err != nil {
+					return err
+				}
+			}
+			if created != nil {
+				f.markCreated(newName, created.ID)
+			}
+			f.hiddenDelete(oldName)
+			f.invalidate(destParent)
+			return nil
+		}
+	}
+
 	n, err := f.resolve(ctx, oldName)
 	if err != nil {
 		return err
@@ -382,26 +658,48 @@ func (f *fs) Rename(ctx context.Context, oldName, newName string) error {
 		return err
 	}
 	base := path.Base(newName)
-	if base != n.name && n.isDir {
-		if err := f.client.RenameDavFolder(ctx, n.id, base); err != nil {
+
+	extChanged := !n.isDir && !strings.EqualFold(path.Ext(base), path.Ext(n.name))
+	if extChanged {
+		// The portal's rename preserves the source extension, so a .tmp could
+		// never become a .txt/.docx target. Copy the content to a file with the
+		// target name and remove the source (Office/editor safe-save path).
+		created, err := f.copyDavFile(ctx, n.id, destID, base)
+		if err != nil {
 			return err
 		}
-	} else if base != n.name {
-		if err := f.client.RenameDavFile(ctx, n.id, base); err != nil {
+		if err := f.client.DeleteDavItems(ctx, nil, []string{n.id}); err != nil {
 			return err
+		}
+		if created != nil {
+			f.markCreated(newName, created.ID)
+		}
+	} else {
+		if base != n.name && n.isDir {
+			if err := f.client.RenameDavFolder(ctx, n.id, base); err != nil {
+				return err
+			}
+		} else if base != n.name {
+			if err := f.client.RenameDavFile(ctx, n.id, base); err != nil {
+				return err
+			}
+		}
+		if destParent != parentOf(oldName) {
+			var fIDs, dIDs []string
+			if n.isDir {
+				dIDs = []string{n.id}
+			} else {
+				fIDs = []string{n.id}
+			}
+			if err := f.client.MoveDavItems(ctx, dIDs, fIDs, destID); err != nil {
+				return err
+			}
+		}
+		if !n.isDir {
+			f.markCreated(newName, n.id)
 		}
 	}
-	if destParent != parentOf(oldName) {
-		var fIDs, dIDs []string
-		if n.isDir {
-			dIDs = []string{n.id}
-		} else {
-			fIDs = []string{n.id}
-		}
-		if err := f.client.MoveDavItems(ctx, dIDs, fIDs, destID); err != nil {
-			return err
-		}
-	}
+	f.unmarkCreated(oldName)
 	f.invalidate(parentOf(oldName))
 	f.invalidate(destParent)
 	return nil
