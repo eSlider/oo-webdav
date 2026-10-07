@@ -34,6 +34,11 @@ type Config struct {
 	// SessionTTL is how long a per-user authenticated session is kept alive
 	// before re-validating credentials against the portal.
 	SessionTTL time.Duration
+	// GatorURL is the base URL of the gator API (e.g. http://172.17.0.1:8631).
+	// When empty, gator document fields are not exposed as WebDAV properties.
+	GatorURL string
+	// GatorRefresh is how often the gator file-field index is rebuilt.
+	GatorRefresh time.Duration
 }
 
 // Load reads configuration from environment variables, applying defaults.
@@ -47,6 +52,8 @@ func Load() Config {
 		CacheTTL:     envDur("CACHE_TTL", 10*time.Second),
 		RootCacheTTL: envDur("ROOT_CACHE_TTL", 10*time.Minute),
 		SessionTTL:   envDur("SESSION_TTL", 15*time.Minute),
+		GatorURL:     strings.TrimSpace(os.Getenv("GATOR_URL")),
+		GatorRefresh: envDur("GATOR_REFRESH", 15*time.Minute),
 	}
 }
 

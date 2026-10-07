@@ -3,8 +3,10 @@ package dav
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,6 +114,51 @@ func (r *readFile) Seek(o int64, w int) (int64, error) {
 	return r.f.Seek(o, w)
 }
 func (r *readFile) Write(p []byte) (int, error) { return 0, webdav.ErrNotImplemented }
+
+// DeadProps implements webdav.DeadPropsHolder: it exposes gator document fields
+// as namespaced read-only properties so WebDAV clients can display and filter
+// them. Returns nothing when gator has no record for the file (feature off, the
+// document was never OCR'd, or it has no oo_file_id link).
+func (r *readFile) DeadProps() (map[xml.Name]webdav.Property, error) {
+	if r.node == nil {
+		return nil, nil
+	}
+	p, ok := r.fs.gator.lookup(r.node.id)
+	if !ok {
+		return nil, nil
+	}
+	values := gatorPropValues(p)
+	out := make(map[xml.Name]webdav.Property, len(gatorPropNames))
+	for _, local := range gatorPropNames {
+		v := values[local]
+		if v == "" {
+			continue
+		}
+		name := xml.Name{Space: gatorNamespace, Local: local}
+		out[name] = webdav.Property{XMLName: name, InnerXML: []byte(escapeXML(v))}
+	}
+	return out, nil
+}
+
+// Patch implements webdav.DeadPropsHolder. Gator properties are read-only, so
+// every patch is forbidden (same as a resource without dead properties).
+func (r *readFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
+	pstat := webdav.Propstat{Status: http.StatusForbidden}
+	for _, patch := range patches {
+		for _, p := range patch.Props {
+			pstat.Props = append(pstat.Props, webdav.Property{XMLName: p.XMLName})
+		}
+	}
+	return []webdav.Propstat{pstat}, nil
+}
+
+// escapeXML escapes a value for use as XML element content.
+func escapeXML(s string) string {
+	if !strings.ContainsAny(s, "&<>") {
+		return s
+	}
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
 
 // dirFile is a directory handle; children are fetched lazily on the first
 // Readdir so PROPFIND/Stat-only callers (which open every node) do not trigger

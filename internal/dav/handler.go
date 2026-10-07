@@ -18,10 +18,11 @@ import (
 // Server authenticates portal users and serves WebDAV against the per-user
 // filesystem.
 type Server struct {
-	cfg  config.Config
-	mu   sync.Mutex
-	sess map[string]*session
-	lock webdav.LockSystem
+	cfg   config.Config
+	mu    sync.Mutex
+	sess  map[string]*session
+	lock  webdav.LockSystem
+	gator *gatorIndex
 }
 
 // session is a per-user authenticated handle.
@@ -34,11 +35,18 @@ type session struct {
 
 // New builds a Server from configuration.
 func New(cfg config.Config) *Server {
-	return &Server{
+	s := &Server{
 		cfg:  cfg,
 		sess: make(map[string]*session),
 		lock: newPermissiveLockSystem(),
 	}
+	// The gator field index is optional (GATOR_URL); refresh runs for the
+	// process lifetime and answers PROPFIND from memory.
+	s.gator = newGatorIndex(cfg.GatorURL, cfg.GatorRefresh)
+	if s.gator != nil {
+		go s.gator.run(context.Background())
+	}
+	return s
 }
 
 // Handler returns the root http.Handler for the server. /healthz is public;
@@ -98,6 +106,7 @@ func (s *Server) getSession(ctx context.Context, user, pass string) (*session, e
 		fs:         newFS(client, s.cfg.WebDAVRoot, s.cfg.CacheTTL, s.cfg.RootCacheTTL),
 		lastActive: time.Now(),
 	}
+	se.fs.gator = s.gator
 	se.handler = &webdav.Handler{
 		Prefix:     s.cfg.WebDAVPrefix,
 		FileSystem: se.fs,

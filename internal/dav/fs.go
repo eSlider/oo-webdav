@@ -39,6 +39,10 @@ type fs struct {
 	// listing is still catching up) and lets an immediate overwrite update the
 	// just-created file by id instead of uploading a duplicate.
 	recent map[string]recentFile
+
+	// gator holds gator document fields by ONLYOFFICE file id, exposed as dead
+	// properties. nil when the feature is disabled.
+	gator *gatorIndex
 }
 
 // recentFile is a remembered create/rename: portal id plus when it happened.
