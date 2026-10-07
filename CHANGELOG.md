@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/eSlider/oo-webdav/compare/v0.2.0...v0.3.0) (2026-10-07)
+
+
+### Features
+
+* **dav:** expose gator document fields as WebDAV properties ([b09123c](https://github.com/eSlider/oo-webdav/commit/b09123c01544c41d6120c5f49dd652f660cc54fb))
+
+
+### Bug Fixes
+
+* **dav:** correct WebDAV writes (duplicates, Office saves, locks) ([db62560](https://github.com/eSlider/oo-webdav/commit/db625608bd8dc3bfda9bb23e5fb76a07b1346641))
+
 ## [0.2.0](https://github.com/eSlider/oo-webdav/compare/v0.1.1...v0.2.0) (2026-10-06)
 
 
