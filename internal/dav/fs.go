@@ -359,8 +359,19 @@ func cleanPath(name string) string {
 	return name
 }
 
-// findChild locates a child by name within a listing, preferring files.
+// findChild locates a child by name within a listing, preferring folders on an
+// exact title match. When no exact match exists it falls back to a trailing
+// dot/space match: Windows strips trailing dots and spaces from names before
+// sending them, so a folder stored as "Neuer Ordner." is otherwise unreachable
+// (and undeletable) by its stripped name "Neuer Ordner".
 func findChild(l *onlyoffice.DavListing, name string) *node {
+	if n := findChildExact(l, name); n != nil {
+		return n
+	}
+	return findChildTrimmed(l, name)
+}
+
+func findChildExact(l *onlyoffice.DavListing, name string) *node {
 	for i := range l.Folders {
 		fd := &l.Folders[i]
 		if fd.Title == name {
@@ -385,6 +396,30 @@ func findChild(l *onlyoffice.DavListing, name string) *node {
 				mtime: fi.ModTime(),
 			}
 		}
+	}
+	return nil
+}
+
+// findChildTrimmed matches a child whose title equals name after trimming
+// trailing dots and spaces. It returns a match only when it is unique, so an
+// ambiguous folder ("Neuer Ordner." and "Neuer Ordner ") is not guessed.
+func findChildTrimmed(l *onlyoffice.DavListing, name string) *node {
+	want := strings.TrimRight(name, ". ")
+	var matches []*node
+	for i := range l.Folders {
+		fd := &l.Folders[i]
+		if strings.TrimRight(fd.Title, ". ") == want {
+			matches = append(matches, &node{name: fd.Title, isDir: true, id: fd.ID, mtime: fd.ModTime(), parentID: fd.ParentID})
+		}
+	}
+	for i := range l.Files {
+		fi := &l.Files[i]
+		if strings.TrimRight(fi.Title, ". ") == want {
+			matches = append(matches, &node{name: fi.Title, isDir: false, id: fi.ID, size: fi.Size, mtime: fi.ModTime()})
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
 	}
 	return nil
 }
