@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/eSlider/oo-webdav/compare/v0.3.0...v0.3.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **dav:** resolve names with trailing dots/spaces ([d88c226](https://github.com/eSlider/oo-webdav/commit/d88c226e7c47a2e8374140965307bd2e5b96dde7))
+
 ## [0.3.0](https://github.com/eSlider/oo-webdav/compare/v0.2.0...v0.3.0) (2026-10-07)
 
 
